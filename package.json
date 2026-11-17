@@ -25,7 +25,8 @@
     "prettier": "^3.9.8",
     "supertest": "^7.3.2",
     "ts-jest": "^29.4.15",
-    "typescript": "5.8.3"
+    "typescript": "5.8.3",
+    "typescript-eslint": "^8.73.0"
   },
   "dependencies": {
     "express": "^5.2.1",
