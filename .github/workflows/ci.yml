@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Part 1 — baseline CI: lint + Jest on every push / PR to main
+  # ---------------------------------------------------------------------------
+  test:
+    name: Lint and test
+    # Pinned (not ubuntu-latest): the tests download a MongoDB binary through
+    # mongodb-memory-server, which needs a distro MongoDB publishes builds for.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      tests_failed: ${{ steps.flag.outputs.tests_failed }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The in-memory MongoDB binary is ~100 MB; cache it between runs.
+      - name: Cache MongoDB test binary
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.cache/mongodb-memory-server
+          key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Lint
+        run: npm run lint
+
+      # `shell: bash` turns on pipefail, so a Jest failure still fails the step
+      # even though the output is piped through tee into test-results.log.
+      - name: Test
+        id: jest
+        shell: bash
+        run: npm test 2>&1 | tee test-results.log
+
+      # Only a failing *test* step should wake the auto-fix job (not lint).
+      - name: Flag test failure
+        id: flag
+        if: failure() && steps.jest.outcome == 'failure'
+        run: echo "tests_failed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Jest failure log
+        if: failure() && steps.jest.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.log
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Part 2 — auto-heal: runs only when the test job failed
+  # ---------------------------------------------------------------------------
+  auto-fix:
+    name: Auto-heal failing tests
+    needs: test
+    # Guards: (1) a test failure, (2) never re-trigger on our own fix branches,
+    # (3) skip fork PRs, whose tokens are read-only.
+    if: ${{ failure() && needs.test.outputs.tests_failed == 'true' && !startsWith(github.head_ref, 'fix/auto-heal-') && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the fix branch
+      pull-requests: write # open the fix PR
+      models: read # call GitHub Models with the built-in token
+    env:
+      # Branch names are untrusted input: keep them in env vars, never inline
+      # them into `run:` scripts.
+      BASE_BRANCH: ${{ github.head_ref || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # At most one open auto-heal PR per broken branch.
+      - name: Look for an existing auto-heal PR
+        id: existing
+        run: |
+          COUNT=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --state open \
+            --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("fix/auto-heal-"))] | length')
+          echo "open_count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Open auto-heal PRs targeting $BASE_BRANCH: $COUNT"
+
+      # Check out the *branch that broke*, not the PR merge commit, so the fix
+      # applies to it and the fix PR can target it.
+      - name: Check out the failing branch
+        if: steps.existing.outputs.open_count == '0'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        if: steps.existing.outputs.open_count == '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.existing.outputs.open_count == '0'
+        run: npm ci
+
+      - name: Cache MongoDB test binary
+        if: steps.existing.outputs.open_count == '0'
+        uses: actions/cache@v4
+        with:
+          path: node_modules/.cache/mongodb-memory-server
+          key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Download Jest failure log
+        if: steps.existing.outputs.open_count == '0'
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: .
+
+      # The agent: reads test-results.log + source context, asks the model for a
+      # fix, applies it to src/ only, and re-runs lint + Jest (up to 3 attempts).
+      - name: Run auto-heal agent
+        id: agent
+        if: steps.existing.outputs.open_count == '0'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTO_HEAL_MODEL: openai/gpt-4.1
+          DIFF_BASE: ${{ github.base_ref && format('origin/{0}', github.base_ref) || '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node .github/scripts/auto-heal.mts
+
+      - name: Commit patch and open pull request
+        if: steps.existing.outputs.open_count == '0' && steps.agent.outputs.patched == 'true'
+        env:
+          PR_BODY_PATH: ${{ steps.agent.outputs.pr_body_path }}
+        run: |
+          set -euo pipefail
+          BRANCH="fix/auto-heal-${{ github.run_id }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          # Stage application code only — never test files.
+          git add -- src ':(exclude)*.test.ts' ':(exclude)*.spec.ts' ':(exclude)src/test'
+          git commit -m "fix: auto-heal failing tests (run ${{ github.run_id }})"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH" \
+            --title "fix: auto-heal failing tests on $BASE_BRANCH" \
+            --body-file "$PR_BODY_PATH"
