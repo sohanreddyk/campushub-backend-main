@@ -52,15 +52,18 @@ class ModelRequestError extends Error {}
 
 // The provider is picked from whichever API key the workflow supplies. With
 // no key it falls back to GitHub Models using the built-in GITHUB_TOKEN.
-type Provider = 'anthropic' | 'openai' | 'github-models';
+type Provider = 'anthropic' | 'openai' | 'gemini' | 'github-models';
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY ?? '';
 const OPENAI_KEY = process.env.OPENAI_API_KEY ?? '';
+const GEMINI_KEY = process.env.GEMINI_API_KEY ?? '';
 const PROVIDER: Provider = ANTHROPIC_KEY
   ? 'anthropic'
   : OPENAI_KEY
     ? 'openai'
-    : 'github-models';
+    : GEMINI_KEY
+      ? 'gemini'
+      : 'github-models';
 
 const DEFAULTS: Record<
   Provider,
@@ -75,6 +78,13 @@ const DEFAULTS: Record<
     model: 'gpt-4.1',
     endpoint: 'https://api.openai.com/v1/chat/completions',
     key: OPENAI_KEY,
+  },
+  // Google's OpenAI-compatible endpoint; the same request shape as OpenAI.
+  gemini: {
+    model: 'gemini-3.5-flash',
+    endpoint:
+      'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+    key: GEMINI_KEY,
   },
   'github-models': {
     model: 'openai/gpt-4.1',

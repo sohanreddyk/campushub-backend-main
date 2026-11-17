@@ -140,10 +140,11 @@ jobs:
         id: agent
         if: steps.existing.outputs.open_count == '0'
         env:
-          # Provider is chosen by whichever secret exists (Anthropic, then OpenAI);
-          # with neither, the agent falls back to GitHub Models via GITHUB_TOKEN.
+          # Provider is chosen by whichever secret exists (Anthropic, OpenAI, then
+          # Gemini); with none, the agent falls back to GitHub Models via GITHUB_TOKEN.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           DIFF_BASE: ${{ github.base_ref && format('origin/{0}', github.base_ref) || '' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
