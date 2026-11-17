@@ -50,11 +50,42 @@ interface ChatMessage {
 // can fix by being asked again, so it stops the run instead of burning attempts.
 class ModelRequestError extends Error {}
 
-const MODEL = process.env.AUTO_HEAL_MODEL ?? 'openai/gpt-4.1';
-const ENDPOINT =
-  process.env.AUTO_HEAL_ENDPOINT ??
-  'https://models.github.ai/inference/chat/completions';
-const API_KEY = process.env.AUTO_HEAL_API_KEY ?? process.env.GITHUB_TOKEN ?? '';
+// The provider is picked from whichever API key the workflow supplies. With
+// no key it falls back to GitHub Models using the built-in GITHUB_TOKEN.
+type Provider = 'anthropic' | 'openai' | 'github-models';
+
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY ?? '';
+const OPENAI_KEY = process.env.OPENAI_API_KEY ?? '';
+const PROVIDER: Provider = ANTHROPIC_KEY
+  ? 'anthropic'
+  : OPENAI_KEY
+    ? 'openai'
+    : 'github-models';
+
+const DEFAULTS: Record<
+  Provider,
+  { model: string; endpoint: string; key: string }
+> = {
+  anthropic: {
+    model: 'claude-sonnet-5-5',
+    endpoint: 'https://api.anthropic.com/v1/messages',
+    key: ANTHROPIC_KEY,
+  },
+  openai: {
+    model: 'gpt-4.1',
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    key: OPENAI_KEY,
+  },
+  'github-models': {
+    model: 'openai/gpt-4.1',
+    endpoint: 'https://models.github.ai/inference/chat/completions',
+    key: process.env.GITHUB_TOKEN ?? '',
+  },
+};
+
+const MODEL = process.env.AUTO_HEAL_MODEL ?? DEFAULTS[PROVIDER].model;
+const ENDPOINT = process.env.AUTO_HEAL_ENDPOINT ?? DEFAULTS[PROVIDER].endpoint;
+const API_KEY = process.env.AUTO_HEAL_API_KEY ?? DEFAULTS[PROVIDER].key;
 const MAX_ATTEMPTS = Number.parseInt(
   process.env.AUTO_HEAL_MAX_ATTEMPTS ?? '3',
   10,
@@ -196,21 +227,63 @@ const initialPrompt = (
 // Model + patch application
 // ---------------------------------------------------------------------------
 
+// Each provider wants a different request shape.
+const requestFor = (messages: ChatMessage[]): RequestInit => {
+  if (PROVIDER === 'anthropic') {
+    const system = messages.find((m) => m.role === 'system')?.content ?? '';
+    return {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 12000,
+        system,
+        messages: messages.filter((m) => m.role !== 'system'),
+      }),
+    };
+  }
+
+  return {
+    method: 'POST',
+    headers: {
+      // GitHub's REST API documents this media type for GitHub Models.
+      Accept:
+        PROVIDER === 'github-models'
+          ? 'application/vnd.github+json'
+          : 'application/json',
+      Authorization: `Bearer ${API_KEY}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'campushub-auto-heal',
+      ...(PROVIDER === 'github-models'
+        ? { 'X-GitHub-Api-Version': '2022-11-28' }
+        : {}),
+    },
+    body: JSON.stringify({ model: MODEL, messages, temperature: 0 }),
+  };
+};
+
+const extractText = (payload: unknown): string | undefined => {
+  const data = payload as {
+    content?: { type?: string; text?: string }[];
+    choices?: { message?: { content?: string } }[];
+  };
+  if (PROVIDER === 'anthropic') {
+    return data.content
+      ?.filter((block) => block.type === 'text')
+      .map((block) => block.text ?? '')
+      .join('');
+  }
+  return data.choices?.[0]?.message?.content;
+};
+
 const callModel = async (messages: ChatMessage[]): Promise<string> => {
   let response: Response;
   try {
-    response = await fetch(ENDPOINT, {
-      method: 'POST',
-      headers: {
-        // GitHub's REST API routes on this media type; plain application/json
-        // gets a bare 200 "OK" instead of a completion.
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-      body: JSON.stringify({ model: MODEL, messages, temperature: 0 }),
-    });
+    response = await fetch(ENDPOINT, requestFor(messages));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new ModelRequestError(`Could not reach ${ENDPOINT}: ${reason}`);
@@ -224,18 +297,17 @@ const callModel = async (messages: ChatMessage[]): Promise<string> => {
   }
 
   const raw = await response.text();
-  let payload: { choices?: { message?: { content?: string } }[] };
+  let payload: unknown;
   try {
-    payload = JSON.parse(raw) as {
-      choices?: { message?: { content?: string } }[];
-    };
+    payload = JSON.parse(raw);
   } catch {
     const contentType = response.headers.get('content-type') ?? 'none';
+    const requestId = response.headers.get('x-github-request-id') ?? 'none';
     throw new ModelRequestError(
-      `Model endpoint answered HTTP ${response.status} (content-type: ${contentType}) with a non-JSON body: ${clip(raw, 300).replace(/\s+/g, ' ')}`,
+      `Model endpoint (${PROVIDER}) answered HTTP ${response.status} (content-type: ${contentType}, final url: ${response.url}, redirected: ${response.redirected}, request id: ${requestId}) with a non-JSON body: ${clip(raw, 300).replace(/\s+/g, ' ')}`,
     );
   }
-  const content = payload.choices?.[0]?.message?.content;
+  const content = extractText(payload);
 
   if (typeof content !== 'string' || content.length === 0) {
     throw new Error('Model response contained no content');
