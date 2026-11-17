@@ -202,7 +202,9 @@ const callModel = async (messages: ChatMessage[]): Promise<string> => {
     response = await fetch(ENDPOINT, {
       method: 'POST',
       headers: {
-        Accept: 'application/json',
+        // GitHub's REST API routes on this media type; plain application/json
+        // gets a bare 200 "OK" instead of a completion.
+        Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${API_KEY}`,
         'Content-Type': 'application/json',
         'X-GitHub-Api-Version': '2022-11-28',
