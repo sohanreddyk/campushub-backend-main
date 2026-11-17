@@ -128,8 +128,8 @@ export async function createReservation(
   const conflict = await ReservationModel.exists({
     resourceId: resourceObjectId,
     status: { $in: BLOCKING_STATUSES },
-    startTime: { $lt: end },
-    endTime: { $gt: start },
+    startTime: { $lte: end },
+    endTime: { $gte: start },
   }).exec();
   if (conflict !== null) {
     throw new ConflictError(
