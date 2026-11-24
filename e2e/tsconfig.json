@@ -1,0 +1,18 @@
+{
+  // Type-checks the Playwright config and E2E code (`npm run e2e:typecheck`).
+  // Playwright and Node run these files directly; this is only for checking.
+  "include": ["./**/*.ts", "../playwright.config.ts"],
+  "compilerOptions": {
+    "module": "nodenext",
+    "target": "esnext",
+    "noEmit": true,
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true
+  }
+}
